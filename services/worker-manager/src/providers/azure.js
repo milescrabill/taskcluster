@@ -17,10 +17,6 @@ const msRestAzure = require('@azure/ms-rest-azure-js');
 const {ApiError, Provider} = require('./provider');
 const {CloudAPI} = require('./cloudapi');
 
-
-const successStates = ['Creating', 'Updating', 'Starting', 'Running', 'Succeeded'];
-const failStates = ['Failed', 'Canceled', 'Deleting', 'Deallocating', 'Stopped', 'Deallocated'];
-
 // only use alphanumeric characters for convenience
 function nicerId() {
   return (slugid.nice() + slugid.nice() + slugid.nice()).toLowerCase().replace(/[^A-Za-z0-9]/g, '');
@@ -45,7 +41,7 @@ function generateAdminPassword() {
   });
 }
 
-function configWithSecrets(cfg) {
+function workerConfigWithSecrets(cfg) {
   assert(_.has(cfg, 'osProfile'));
   // Windows admin user name cannot be more than 20 characters long, be empty,
   // end with a period(.), or contain the following characters: \\ / \" [ ] : | < > + = ; , ? * @.
@@ -368,6 +364,7 @@ class AzureProvider extends Provider {
 
   async scanPrepare() {
     this.seen = {};
+    this.errors = {};
   }
 
   /**
@@ -375,17 +372,19 @@ class AzureProvider extends Provider {
    * Returns true if the operation is in progress, false otherwise
    *
    * op: a URL for tracking the ongoing status of an Azure operation
+   * errors: a list that will have any errors found for that operation appended to it
    */
-  async handleOperation(op) {
+  async handleOperation({op, errors}) {
     let req, resp;
     try {
+      // TODO: we could be smarter about getting operation status
+      // see here: https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/async-operations
       req = new msRestJS.WebResource(op, 'GET');
       // sendLongRunningRequest polls until finished but this is just reading
       // the status of an operation so it shouldn't block long
       // it's ok if we hit an error here, that will trigger resource teardown
       resp = await this._enqueue('opRead', () => this.restClient.sendLongRunningRequest(req));
     } catch (err) {
-      console.log(op, resp, err);
       // Rest API has different error semantics than the SDK
       if (_.has(resp, 'status') && resp.status === 404) {
         // operation not found because it has either expired or does not exist
@@ -400,6 +399,18 @@ class AzureProvider extends Provider {
       // status is guaranteed to exist if the operation was found
       if (body.status === 'InProgress') {
         return true;
+      }
+      if (body.error) {
+        errors.push({
+          kind: 'operation-error',
+          title: 'Operation Error',
+          description: body.error.message,
+          extra: {
+            code: body.error.code,
+          },
+          notify: this.notify,
+          WorkerPoolError: this.WorkerPoolError,
+        });
       }
     }
 
@@ -422,11 +433,10 @@ class AzureProvider extends Provider {
    */
   async _provisionResource({worker, client, resourceType, resourceConfig, modifyFn}) {
     if (!_.has(worker.providerData, resourceType)) {
-      throw new Error(`Worker providerData does not contain resourceType ${resourceType}`);
+      throw new Error(`Error provisioning worker: providerData does not contain resourceType ${resourceType}`);
     }
     let typeData = worker.providerData[resourceType];
 
-    console.log(resourceType, typeData);
     // we have no id, so we try to lookup resource by name
     if (!typeData.id) {
       try {
@@ -441,19 +451,21 @@ class AzureProvider extends Provider {
         });
       } catch (err) {
         if (err.statusCode !== 404) {
-          // we should have an operation, check status
-          if (typeData.operation) {
-            // TODO: we could be smarter about getting operation status
-            // see here: https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/async-operations
-            let op = await this.handleOperation(typeData.operation);
-            if (op) {
-              // still in progress, wait
-              return;
-            }
+          throw err;
+        }
+        // if we've made the request
+        // we should have an operation, check status
+        if (typeData.operation) {
+          let op = await this.handleOperation({
+            op: typeData.operation,
+            errors: this.errors[worker.workerPoolId],
+          });
+          if (!op) {
+            // if the operation has expired or does not exist
+            // chances are our instance has been deleted off band
+            await this.removeWorker({worker});
           }
         }
-        // error or failed operation
-        throw err;
       }
     }
     // failed to lookup resource by name
@@ -524,7 +536,7 @@ class AzureProvider extends Provider {
         worker,
         client: this.networkClient.networkInterfaces,
         resourceType: 'nic',
-        config: nicConfig,
+        resourceConfig: nicConfig,
         modifyFn: nicModifyFunc,
       });
       if (!worker.providerData.nic.id) {
@@ -537,7 +549,7 @@ class AzureProvider extends Provider {
         worker,
         client: this.computeClient.virtualMachines,
         resourceType: 'vm',
-        config: configWithSecrets(worker.providerData.vm.config),
+        resourceConfig: workerConfigWithSecrets(worker.providerData.vm.config),
         modifyFn: () => {},
       });
       if (!worker.providerData.vm.id) {
@@ -558,6 +570,7 @@ class AzureProvider extends Provider {
   async checkWorker({worker}) {
     const states = this.Worker.states;
     this.seen[worker.workerPoolId] = this.seen[worker.workerPoolId] || 0;
+    this.errors[worker.workerPoolId] = this.errors[worker.workerPoolId] || [];
 
     if (worker.providerData.registrationExpiry &&
       worker.state === states.REQUESTED &&
@@ -571,6 +584,8 @@ class AzureProvider extends Provider {
         worker.providerData.resourceGroupName,
         worker.providerData.vm.name,
       ));
+      const successStates = ['Creating', 'Updating', 'Starting', 'Running', 'Succeeded'];
+      const failStates = ['Failed', 'Canceled', 'Deleting', 'Deallocating', 'Stopped', 'Deallocated'];
       if (successStates.includes(provisioningState)) {
         this.seen[worker.workerPoolId] += worker.capacity || 1;
 
@@ -625,14 +640,27 @@ class AzureProvider extends Provider {
    */
   async scanCleanup() {
     this.monitor.log.scanSeen({providerId: this.providerId, seen: this.seen});
+    await Promise.all(Object.entries(this.seen).map(async ([workerPoolId, seen]) => {
+      const workerPool = await this.WorkerPool.load({
+        workerPoolId,
+      }, true);
+
+      if (!workerPool) {
+        return; // In this case, the workertype has been deleted so we can just move on
+      }
+
+      if (this.errors[workerPoolId].length) {
+        await Promise.all(this.errors[workerPoolId].map(error => workerPool.reportError(error)));
+      }
+    }));
   }
 
   /*
    * removeResource attempts to delete a resource and verify deletion
    */
   async removeResource({client, worker, resourceType}) {
-    if (!_.has(worker.providerData, 'resourceType')) {
-      throw new Error(`Worker providerData does not contain resourceType ${resourceType}`);
+    if (!_.has(worker.providerData, resourceType)) {
+      throw new Error(`Error removing worker: providerData does not contain resourceType ${resourceType}`);
     }
     let typeData = worker.providerData[resourceType];
 
@@ -644,14 +672,19 @@ class AzureProvider extends Provider {
           worker.providerData.resourceGroupName,
           typeData.name,
         ));
-        if (provisioningState in successStates) {
+        // resource could be successful, failed, etc.
+        // we have not yet tried to delete the resource
+        if (!(['Deleting', 'Deallocating', 'Deallocated'].includes(provisioningState))) {
           shouldDelete = true;
         }
       } catch (err) {
         if (err.statusCode === 404) {
           // TODO: should this be the only success condition?
-          // redoes lots of GET requests
+          // repeats lots of GET requests
           // resource has been deleted or never existed
+          await worker.modify(w => {
+            w.providerData[resourceType].id = false;
+          });
           return true;
         }
         throw err;
@@ -691,17 +724,43 @@ class AzureProvider extends Provider {
     }
 
     let state = states.STOPPING;
+    if (worker.state !== state) {
+      await worker.modify(w => {
+        const now = new Date();
+        w.lastModified = now;
+        w.lastChecked = now;
+        w.state = state;
+      });
+    }
 
+    // After we make the delete request we set id to false
+    // some delete operations (i.e. VMs) take a long time though
     try {
       // VM must be deleted before disk
       // VM must be deleted before NIC
       // NIC must be deleted before IP
-      let vmDeleted = await this.removeResource({
+      await this.removeResource({
         worker,
         client: this.computeClient.virtualMachines,
         resourceType: 'vm',
       });
-      if (!vmDeleted) {
+      if (worker.providerData.vm.id) {
+        return;
+      }
+      await this.removeResource({
+        worker,
+        client: this.networkClient.networkInterfaces,
+        resourceType: 'nic',
+      });
+      if (worker.providerData.nic.id) {
+        return;
+      }
+      await this.removeResource({
+        worker,
+        client: this.networkClient.publicIPAddresses,
+        resourceType: 'ip',
+      });
+      if (worker.providerData.ip.id) {
         return;
       }
       // no need to check return here
@@ -710,31 +769,9 @@ class AzureProvider extends Provider {
         client: this.computeClient.disks,
         resourceType: 'disk',
       });
-      let nicDeleted = await this.removeResource({
-        worker,
-        client: this.networkClient.networkInterfaces,
-        resourceType: 'nic',
-      });
-      if (!nicDeleted) {
-        return;
-      }
-      let ipDeleted = await this.removeResource({
-        worker,
-        client: this.networkClient.publicIPAddresses,
-        resourceType: 'ip',
-      });
-      if (!ipDeleted) {
-        return;
-      }
-      // IP is last to go
+
+      // change to stopped
       state = states.STOPPED;
-    } catch (err) {
-      await worker.workerPool.reportError({
-        kind: 'deletion-error',
-        title: 'VM Deletion Error',
-        description: err.message,
-      });
-    } finally {
       await worker.modify(w => {
         const now = new Date();
         if (w.state !== state) {
@@ -742,6 +779,17 @@ class AzureProvider extends Provider {
         }
         w.lastChecked = now;
         w.state = state;
+      });
+    } catch (err) {
+      this.errors[worker.workerPoolId].push({
+        kind: 'deletion-error',
+        title: 'Deletion Error',
+        description: err.message,
+        extra: {
+          code: err.code,
+        },
+        notify: this.notify,
+        WorkerPoolError: this.WorkerPoolError,
       });
     }
   }

@@ -40,12 +40,12 @@ class FakeAzure {
 
     return {
       networkInterfaces: {
-        createOrUpdate: async () => createOrUpdateNICStub(),
-        deleteMethod: async () => this.deleteNICStub(),
+        beginCreateOrUpdate: async () => createOrUpdateNICStub(),
+        beginDeleteMethod: async () => this.deleteNICStub(),
       },
       publicIPAddresses: {
-        createOrUpdate: async () => createOrUpdateIPStub(),
-        deleteMethod: async () => this.deleteIPStub(),
+        beginCreateOrUpdate: async () => createOrUpdateIPStub(),
+        beginDeleteMethod: async () => this.deleteIPStub(),
       },
     };
   }
@@ -110,12 +110,12 @@ class FakeAzure {
 
     return {
       virtualMachines: {
-        createOrUpdate: async () => createOrUpdateVMStub(),
+        beginCreateOrUpdate: async () => createOrUpdateVMStub(),
         get: async () => getVMStub(),
-        deleteMethod: async () => this.deleteVMStub(),
+        beginDeleteMethod: async () => this.deleteVMStub(),
       },
       disks: {
-        deleteMethod: async () => this.deleteDiskStub(),
+        beginDeleteMethod: async () => this.deleteDiskStub(),
       },
     };
   }
