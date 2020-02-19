@@ -17,6 +17,10 @@ const msRestAzure = require('@azure/ms-rest-azure-js');
 const {ApiError, Provider} = require('./provider');
 const {CloudAPI} = require('./cloudapi');
 
+
+const successStates = ['Creating', 'Updating', 'Starting', 'Running', 'Succeeded'];
+const failStates = ['Failed', 'Canceled', 'Deleting', 'Deallocating', 'Stopped', 'Deallocated'];
+
 // only use alphanumeric characters for convenience
 function nicerId() {
   return (slugid.nice() + slugid.nice() + slugid.nice()).toLowerCase().replace(/[^A-Za-z0-9]/g, '');
@@ -39,6 +43,17 @@ function generateAdminPassword() {
     symbols: true,
     strict: true,
   });
+}
+
+function configWithSecrets(cfg) {
+  assert(_.has(cfg, 'osProfile'));
+  // Windows admin user name cannot be more than 20 characters long, be empty,
+  // end with a period(.), or contain the following characters: \\ / \" [ ] : | < > + = ; , ? * @.
+  cfg.osProfile.adminUsername = nicerId().slice(0, 20);
+  // we have to set a password, but we never want it to be used, so we throw it away
+  // a legitimate user who needs access can reset the password
+  cfg.osProfile.adminPassword = generateAdminPassword();
+  return cfg;
 }
 
 class AzureProvider extends Provider {
@@ -74,9 +89,9 @@ class AzureProvider extends Provider {
       monitor: this.monitor,
       providerId: this.providerId,
       errorHandler: ({err, tries}) => {
-        if (err.code === 429) { // too many requests
+        if (err.statusCode === 429) { // too many requests
           return {backoff: _backoffDelay * 50, reason: 'rateLimit', level: 'notice'};
-        } else if (err.code >= 500) { // For 500s, let's take a shorter backoff
+        } else if (err.statusCode >= 500) { // For 500s, let's take a shorter backoff
           return {backoff: _backoffDelay * Math.pow(2, tries), reason: 'errors', level: 'warning'};
         }
         // If we don't want to do anything special here, just throw and let the
@@ -129,7 +144,7 @@ class AzureProvider extends Provider {
       toSpawn -= cfg.capacityPerInstance;
     }
 
-    // Create "empty" workers to provision in _provisionResources loop
+    // Create "empty" workers to provision in provisionResources loop
     await Promise.all(cfgs.map(async cfg => {
       // This must be unique to currently existing instances and match [a-z]([-a-z0-9]*[a-z0-9])?
       // The lost entropy from downcasing, etc should be ok due to the fact that
@@ -156,12 +171,9 @@ class AzureProvider extends Provider {
         ...cfg,
         osProfile: {
           ...cfg.osProfile,
-          // Windows admin user name cannot be more than 20 characters long, be empty,
-          // end with a period(.), or contain the following characters: \\ / \" [ ] : | < > + = ; , ? * @.
-          adminUsername: nicerId().slice(0, 20),
-          // we have to set a password, but we never want it to be used, so we throw it away
-          // a legitimate user who needs access can reset the password
-          adminPassword: generateAdminPassword(),
+          // adminUsername and adminPassword will be added later
+          // because we are saving this config to providerData
+          // and they are obfuscated / intended to be secret
           computerName,
           customData,
         },
@@ -356,31 +368,31 @@ class AzureProvider extends Provider {
 
   async scanPrepare() {
     this.seen = {};
-    this.errors = {};
   }
 
   /**
-   * Used to check in on the state of any operations
-   * that are ongoing. This should not be used to gate
-   * any other actions in the provider as we may fail to write these
-   * operations when we create them. This is just a nice-to-have for
-   * reporting configuration/provisioning errors to the users.
+   * Checks the status of ongoing Azure operations
+   * Returns true if the operation is in progress, false otherwise
    *
-   * op: an object with keys `name` and optionally `region` or `zone` if it is a region or zone based operation
-   * errors: a list that will have any errors found for that operation appended to it
+   * op: a URL for tracking the ongoing status of an Azure operation
    */
-  async handleOperation({op, errors}) {
-    // op is a URL to follow-up on operation progress
+  async handleOperation(op) {
     let req, resp;
-    req = new msRestJS.WebResource(op, 'GET');
-    // sendLongRunningRequest polls until finished but this is just reading
-    // the status of an operation so it shouldn't block long
-    // it's ok if we hit an error here, that will trigger resource teardown
-    resp = await this._enqueue('opRead', () => this.restClient.sendLongRunningRequest(req));
-    if (resp.status === 404) {
-      // operation not found because it has either expired or does not exist
-      // nothing more to do
-      return false;
+    try {
+      req = new msRestJS.WebResource(op, 'GET');
+      // sendLongRunningRequest polls until finished but this is just reading
+      // the status of an operation so it shouldn't block long
+      // it's ok if we hit an error here, that will trigger resource teardown
+      resp = await this._enqueue('opRead', () => this.restClient.sendLongRunningRequest(req));
+    } catch (err) {
+      console.log(op, resp, err);
+      // Rest API has different error semantics than the SDK
+      if (_.has(resp, 'status') && resp.status === 404) {
+        // operation not found because it has either expired or does not exist
+        // nothing more to do
+        return false;
+      }
+      throw err;
     }
 
     let body = resp.parsedBody;
@@ -394,34 +406,57 @@ class AzureProvider extends Provider {
     return false;
   }
 
-  async _provisionResource(client, {worker}, resourceType, resourceConfig, modifyCallback) {
+  /**
+   * _provisionResource generically provisions individual resources
+   * Handles cases where:
+   *  we have not yet created a resource and need to create one,
+   *  we have requested a resource but it is not ready,
+   *  we have a resource ready to go
+   *
+   * worker: the worker for which the resource is being provisioned
+   * client: the Azure SDK client for the resource
+   * resourceType: the short name used to identify the resource in providerData
+   * resourceConfig: configuration to be passed to the SDK for resource creation
+   * modifyFn: a function (worker, resource) that takes the worker and the created
+   *   resource, allowing the worker to be modified.
+   */
+  async _provisionResource({worker, client, resourceType, resourceConfig, modifyFn}) {
     if (!_.has(worker.providerData, resourceType)) {
       throw new Error(`Worker providerData does not contain resourceType ${resourceType}`);
     }
     let typeData = worker.providerData[resourceType];
+
+    console.log(resourceType, typeData);
+    // we have no id, so we try to lookup resource by name
     if (!typeData.id) {
       try {
         let resource = await this._enqueue('query', () => client.get(
           worker.providerData.resourceGroupName,
           typeData.name,
         ));
+        // we found the resource
         await worker.modify(w => {
           w.providerData[resourceType].id = resource.id;
-          modifyCallback(w, resource);
+          modifyFn(w, resource);
         });
       } catch (err) {
         if (err.statusCode !== 404) {
           // we should have an operation, check status
-          let opResult;
           if (typeData.operation) {
-            opResult = await this.handleOperation({op: typeData.operation, errors: this.errors[worker.workerPoolId]});
-          }
-          if (!opResult) {
-            throw err;
+            // TODO: we could be smarter about getting operation status
+            // see here: https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/async-operations
+            let op = await this.handleOperation(typeData.operation);
+            if (op) {
+              // still in progress, wait
+              return;
+            }
           }
         }
+        // error or failed operation
+        throw err;
       }
     }
+    // failed to lookup resource by name
     if (!typeData.id) {
       // we need to create the resource
       let resourceRequest = await this._enqueue('query', () => client.beginCreateOrUpdate(
@@ -429,188 +464,100 @@ class AzureProvider extends Provider {
         typeData.name,
         resourceConfig,
       ));
+      // track operation
       await worker.modify(w => {
         w.providerData[resourceType].operation = resourceRequest.getPollState().azureAsyncOperationHeaderValue;
       });
     }
   }
 
-  async _provisionResources({worker}) {
-    let data = worker.providerData;
-    let ipAddressRequest, networkInterfaceRequest, virtualMachineRequest;
-
-    // For each resource:
-    // Do we have an ID? If not, do we have a name?
-    // // Look up resource by name
-    // // // If the resource exists, get its ID, save it, continue
-    // // // If the resource does not exist, create it
-    // // // If we encounter a non-404 error looking for a resource, check its operation for errors
-    // We have an ID => we can use that ID to provision the next resource
+  /**
+   * provisionResources wraps the process of provisioning worker resources
+   *
+   * This function is expected to be called several times per worker as
+   * resources are created.
+   */
+  async provisionResources({worker}) {
     try {
-      // check whether the IP exists _now_
-      // or check on the operation that is creating it
-      if (!data.ip.id) {
-        try {
-          let ipAddress = await this._enqueue('query', () => this.networkClient.publicIPAddresses.get(
-            data.resourceGroupName,
-            data.ip.name,
-          ));
-          await worker.modify(w => {
-            w.providerData.ip.id = ipAddress.id;
-          });
-        } catch (err) {
-          if (err.statusCode !== 404) {
-            // we have an operation from the create request, check status
-            let opResult;
-            if (data.ip.operation) {
-              opResult = await this.handleOperation({op: data.ip.operation, errors: this.errors[worker.workerPoolId]});
-            }
-            if (!opResult) {
-              throw err;
-            }
-          }
-        }
+      // IP
+      let ipConfig = {
+        location: worker.providerData.location,
+        publicIPAllocationMethod: 'Dynamic',
+      };
+      this._provisionResource({
+        worker,
+        client: this.networkClient.publicIPAddresses,
+        resourceType: 'ip',
+        resourceConfig: ipConfig,
+        modifyFn: () => {},
+      });
+      if (!worker.providerData.ip.id) {
+        return worker.state;
       }
 
-      // if we got an IP from above, we'll skip this
-      // otherwise, we'll request a new IP
-      if (!data.ip.id) {
-        // we need to create a fresh IP
-        ipAddressRequest = await this._enqueue('query', () => this.networkClient.publicIPAddresses.beginCreateOrUpdate(
-          data.resourceGroupName,
-          data.ip.name,
+      // NIC
+      let nicConfig = {
+        location: worker.providerData.location,
+        ipConfigurations: [
           {
-            location: data.location,
-            publicIPAllocationMethod: 'Dynamic',
+            name: worker.providerData.nic.name,
+            privateIPAllocationMethod: 'Dynamic',
+            subnet: {
+              id: worker.providerData.subnet.id,
+            },
+            publicIPAddress: {
+              id: worker.providerData.ip.id,
+            },
           },
-        ));
-        await worker.modify(w => {
-          w.providerData.ip.operation = ipAddressRequest.getPollState().azureAsyncOperationHeaderValue;
-        });
-        // this resource is not yet ready
-        // we have to wait for the next iteration
-        return;
-      }
-
-      if (!data.nic.id) {
-        try {
-          let networkInterface = await this._enqueue('query', () => this.networkClient.networkInterfaces.get(
-            data.resourceGroupName,
-            data.nic.name,
-          ));
-          await worker.modify(w => {
-            w.providerData.nic.id = networkInterface.id;
-            // we needed NIC id to create this
-            w.providerData.vm.config.networkProfile.networkInterfaces = [
-              {
-                id: data.nic.id,
-                primary: true,
-              },
-            ];
-          });
-        } catch (err) {
-          if (err.statusCode !== 404) {
-            // we should have an operation, check status
-            let opResult;
-            if (data.nic.operation) {
-              opResult = await this.handleOperation({op: data.nic.operation, errors: this.errors[worker.workerPoolId]});
-            }
-            if (!opResult) {
-              throw err;
-            }
-          }
-        }
-      }
-
-      if (!data.nic.id) {
-        // we need to create a fresh NIC
-        networkInterfaceRequest = await this._enqueue('query', () => this.networkClient.networkInterfaces.beginCreateOrUpdate(
-          data.resourceGroupName,
-          data.nic.name,
+        ],
+      };
+      // set up the VM network interface config
+      let nicModifyFunc = (w, nic) => {
+        w.providerData.vm.config.networkProfile.networkInterfaces = [
           {
-            location: data.location,
-            ipConfigurations: [
-              {
-                name: data.nic.name,
-                privateIPAllocationMethod: 'Dynamic',
-                subnet: {
-                  id: data.subnet.id,
-                },
-                publicIPAddress: {
-                  id: data.ip.id,
-                },
-              },
-            ],
+            id: nic.id,
+            primary: true,
           },
-        ));
-        await worker.modify(w => {
-          w.providerData.nic.operation = networkInterfaceRequest.getPollState().azureAsyncOperationHeaderValue;
-        });
-        // this resource is not yet ready
-        // we have to wait for the next iteration
-        return;
+        ];
+      };
+      this._provisionResource({
+        worker,
+        client: this.networkClient.networkInterfaces,
+        resourceType: 'nic',
+        config: nicConfig,
+        modifyFn: nicModifyFunc,
+      });
+      if (!worker.providerData.nic.id) {
+        return worker.state;
       }
 
-      // check whether the VM exists _now_
-      // or check on the operation that is creating it
-      if (!data.vm.id) {
-        try {
-          let vm = await this._enqueue('query', () => this.computeClient.virtualMachines.get(
-            data.resourceGroupName,
-            data.vm.name,
-          ));
-          await worker.modify(w => {
-            w.providerData.vm.id = vm.id;
-          });
-        } catch (err) {
-          if (err.statusCode !== 404) {
-            // we should have an operation, check status
-            let opResult;
-            if (data.vm.operation) {
-              opResult = await this.handleOperation({op: data.vm.operation, errors: this.errors[worker.workerPoolId]});
-            }
-            if (!opResult) {
-              throw err;
-            }
-          }
-        }
+      // VM
+      // NB: if we ever need disk id for anything, we could get it here
+      this._provisionResource({
+        worker,
+        client: this.computeClient.virtualMachines,
+        resourceType: 'vm',
+        config: configWithSecrets(worker.providerData.vm.config),
+        modifyFn: () => {},
+      });
+      if (!worker.providerData.vm.id) {
+        return worker.state;
       }
-
-      // if we got an IP from above, we'll skip this
-      // otherwise, we'll request a new IP
-      if (!data.vm.id) {
-        // we need to create a fresh IP
-        virtualMachineRequest = await this._enqueue('query', () => this.computeClient.virtualMachines.beginCreateOrUpdate(
-          data.resourceGroupName,
-          data.vm.name,
-          data.vm.config,
-        ));
-        await worker.modify(w => {
-          w.providerData.vm.operation = virtualMachineRequest.getPollState().azureAsyncOperationHeaderValue;
-        });
-        // this resource is not yet ready
-        // we have to wait for the next iteration
-        return;
-      }
+      return this.Worker.states.RUNNING;
     } catch (err) {
       // we create multiple resources in order to provision a VM
       // if we catch an error we want to deprovision those resources
-      await this._removeWorker({...data});
       await worker.workerPool.reportError({
         kind: 'creation-error',
         title: 'VM Creation Error',
         description: err.message,
-        extra: err.details,
       });
-      return;
     }
   }
 
   async checkWorker({worker}) {
     const states = this.Worker.states;
     this.seen[worker.workerPoolId] = this.seen[worker.workerPoolId] || 0;
-    this.errors[worker.workerPoolId] = this.errors[worker.workerPoolId] || [];
-    console.log(`${worker.workerId}`);
 
     if (worker.providerData.registrationExpiry &&
       worker.state === states.REQUESTED &&
@@ -624,8 +571,7 @@ class AzureProvider extends Provider {
         worker.providerData.resourceGroupName,
         worker.providerData.vm.name,
       ));
-      console.log(`${worker.workerId}, ${state}, ${provisioningState}`);
-      if (['Creating', 'Updating', 'Starting', 'Running', 'Succeeded'].includes(provisioningState)) {
+      if (successStates.includes(provisioningState)) {
         this.seen[worker.workerPoolId] += worker.capacity || 1;
 
         // If the worker will be expired soon but it still exists,
@@ -637,14 +583,13 @@ class AzureProvider extends Provider {
             w.expires = taskcluster.fromNow('1 week');
           });
         }
-      } else if (['Failed', 'Canceled', 'Deleting', 'Deallocating', 'Stopped', 'Deallocated'].includes(provisioningState)) {
+      } else if (failStates.includes(provisioningState)) {
         await this.removeWorker({worker});
         this.monitor.log.workerStopped({
           workerPoolId: worker.workerPoolId,
           providerId: this.providerId,
           workerId: worker.workerId,
         });
-        state = states.STOPPED;
       } else {
         await worker.workerPool.reportError({
           kind: 'creation-error',
@@ -653,18 +598,17 @@ class AzureProvider extends Provider {
         });
       }
     } catch (err) {
-      if (err.code !== 'ResourceNotFound') {
+      if (err.statusCode !== 404) {
         throw err;
       }
-      await this._provisionResources({worker});
-      // TODO: we need a new cleanup approach
-      // await this.removeWorker({worker});
-      // this.monitor.log.workerStopped({
-      //   workerPoolId: worker.workerPoolId,
-      //   providerId: this.providerId,
-      //   workerId: worker.workerId,
-      // });
-      // state = states.STOPPED;
+      // we're either provisioning or stopping this worker
+      if (state === states.REQUESTED) {
+        state = await this.provisionResources({worker});
+      }
+      // if provisioning went awry
+      if (state === states.STOPPING) {
+        await this.removeWorker({worker});
+      }
     }
     await worker.modify(w => {
       const now = new Date();
@@ -681,60 +625,125 @@ class AzureProvider extends Provider {
    */
   async scanCleanup() {
     this.monitor.log.scanSeen({providerId: this.providerId, seen: this.seen});
-    await Promise.all(Object.entries(this.seen).map(async ([workerPoolId, seen]) => {
-      const workerPool = await this.WorkerPool.load({
-        workerPoolId,
-      }, true);
-
-      if (!workerPool) {
-        return; // In this case, the workertype has been deleted so we can just move on
-      }
-
-      if (this.errors[workerPoolId].length) {
-        await Promise.all(this.errors[workerPoolId].map(error => workerPool.reportError(error)));
-      }
-    }));
   }
 
-  async _removeWorker({resourceGroupName, location, vm, ip, nic, disk}) {
-    // clean up related resources, continue on errors
-    // delete VM, IP, NIC, and disk
-    const ignoreNotFound = async (promise) => {
+  /*
+   * removeResource attempts to delete a resource and verify deletion
+   */
+  async removeResource({client, worker, resourceType}) {
+    if (!_.has(worker.providerData, 'resourceType')) {
+      throw new Error(`Worker providerData does not contain resourceType ${resourceType}`);
+    }
+    let typeData = worker.providerData[resourceType];
+
+    let shouldDelete = false;
+    // lookup resource by name
+    if (!typeData.id) {
       try {
-        await promise;
+        let {provisioningState} = await this._enqueue('query', () => client.get(
+          worker.providerData.resourceGroupName,
+          typeData.name,
+        ));
+        if (provisioningState in successStates) {
+          shouldDelete = true;
+        }
       } catch (err) {
-        if (err.code === 404) {
-          return; // Nothing to do, it is already gone
+        if (err.statusCode === 404) {
+          // TODO: should this be the only success condition?
+          // redoes lots of GET requests
+          // resource has been deleted or never existed
+          return true;
         }
         throw err;
       }
-    };
-    // VM, disk, and NIC _should_ be able to be deleted in parallel
-    // if we get "in use" failures for NIC/disk they will be retried
-    await Promise.all([
-      ignoreNotFound(this._enqueue('query', () => this.computeClient.virtualMachines.deleteMethod(
-        resourceGroupName,
-        vm.name,
-      ))),
-      ignoreNotFound(this._enqueue('query', () => this.networkClient.networkInterfaces.deleteMethod(
-        resourceGroupName,
-        nic.name,
-      ))),
-      await ignoreNotFound(this._enqueue('query', () => this.computeClient.disks.deleteMethod(
-        resourceGroupName,
-        disk.name,
-      ))),
-    ]);
-    // the public IP cannot be deleted as long as it is attached
-    // can become orphaned if we try to delete before the NIC is deleted
-    await ignoreNotFound(this._enqueue('query', () => this.networkClient.publicIPAddresses.deleteMethod(
-      resourceGroupName,
-      ip.name,
-    )));
+    }
+
+    // FIXME: possible resource leak
+    // we don't check operation status: no differentiating between
+    // operation => create and operation => delete
+    if (typeData.id || shouldDelete) {
+      // we need to delete the resource
+      let deleteRequest = await this._enqueue('query', () => client.beginDeleteMethod(
+        worker.providerData.resourceGroupName,
+        typeData.name,
+      ));
+      // track operation
+      await worker.modify(w => {
+        w.providerData[resourceType].id = false;
+        w.providerData[resourceType].operation = deleteRequest.getPollState().azureAsyncOperationHeaderValue;
+      });
+    }
+    return false;
   }
 
+  /*
+   * removeWorker marks a worker for deletion and begins removal
+   *
+   * worker: the worker for which the resource is being provisioned
+   * client: the Azure SDK client for the resource
+   * resourceType: the short name used to identify the resource in providerData
+   */
   async removeWorker({worker}) {
-    await this._removeWorker({...worker.providerData});
+    let states = this.Worker.states;
+    if (worker.state === states.STOPPED) {
+      // we're done
+      return;
+    }
+
+    let state = states.STOPPING;
+
+    try {
+      // VM must be deleted before disk
+      // VM must be deleted before NIC
+      // NIC must be deleted before IP
+      let vmDeleted = await this.removeResource({
+        worker,
+        client: this.computeClient.virtualMachines,
+        resourceType: 'vm',
+      });
+      if (!vmDeleted) {
+        return;
+      }
+      // no need to check return here
+      await this.removeResource({
+        worker,
+        client: this.computeClient.disks,
+        resourceType: 'disk',
+      });
+      let nicDeleted = await this.removeResource({
+        worker,
+        client: this.networkClient.networkInterfaces,
+        resourceType: 'nic',
+      });
+      if (!nicDeleted) {
+        return;
+      }
+      let ipDeleted = await this.removeResource({
+        worker,
+        client: this.networkClient.publicIPAddresses,
+        resourceType: 'ip',
+      });
+      if (!ipDeleted) {
+        return;
+      }
+      // IP is last to go
+      state = states.STOPPED;
+    } catch (err) {
+      await worker.workerPool.reportError({
+        kind: 'deletion-error',
+        title: 'VM Deletion Error',
+        description: err.message,
+      });
+    } finally {
+      await worker.modify(w => {
+        const now = new Date();
+        if (w.state !== state) {
+          w.lastModified = now;
+        }
+        w.lastChecked = now;
+        w.state = state;
+      });
+    }
   }
 }
 
