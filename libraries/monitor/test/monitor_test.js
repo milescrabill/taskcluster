@@ -448,6 +448,7 @@ suite(testing.suiteName(), function() {
 
     test('monitor.patchAWS(service)', async () => {
       const aws = require('aws-sdk');
+      aws.config.logger = console;
       const ec2 = new aws.EC2({
         region: 'us-west-2',
         credentials: new aws.Credentials('akid', 'fake', 'session'),

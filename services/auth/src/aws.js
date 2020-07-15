@@ -1,4 +1,5 @@
 const AWS = require('aws-sdk');
+AWS.config.logger = console;
 const builder = require('./api');
 const {find} = require('lodash');
 

@@ -1,5 +1,6 @@
 const _ = require('lodash');
 const AWS = require('aws-sdk');
+AWS.config.logger = console;
 
 const setupIam = async ({iam, iamName, iamPolicy}) => {
   try {

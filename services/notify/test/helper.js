@@ -1,6 +1,7 @@
 const assert = require('assert');
 const path = require('path');
 const aws = require('aws-sdk');
+aws.config.logger = console;
 const taskcluster = require('taskcluster-client');
 const {stickyLoader, Secrets, fakeauth, withPulse, withMonitor, withDb, resetTables} = require('taskcluster-lib-testing');
 const builder = require('../src/api');

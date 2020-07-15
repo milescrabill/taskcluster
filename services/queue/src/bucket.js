@@ -1,4 +1,5 @@
 let aws = require('aws-sdk');
+aws.config.logger = console;
 let _ = require('lodash');
 let debug = require('debug')('app:bucket');
 let assert = require('assert');

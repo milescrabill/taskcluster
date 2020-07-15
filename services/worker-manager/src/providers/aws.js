@@ -1,5 +1,6 @@
 const {ApiError, Provider} = require('./provider');
 const aws = require('aws-sdk');
+aws.config.logger = console;
 const taskcluster = require('taskcluster-client');
 const crypto = require('crypto');
 const fs = require('fs');

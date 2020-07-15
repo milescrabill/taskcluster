@@ -282,6 +282,7 @@ as in the following example:
 
 ```js
 const aws = require('aws-sdk');
+aws.config.logger = console;
 const ec2 = new aws.EC2({region: 'us-west-2'});
 monitor.patchAWS(ec2);
 await ec2.describeAvailabilityZones().promise().catch(err => {

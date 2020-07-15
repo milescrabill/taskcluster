@@ -1,6 +1,7 @@
 const {FakeCloud} = require('./fake');
 const assert = require('assert').strict;
 const aws = require('aws-sdk');
+aws.config.logger = console;
 
 /**
  * Fake the EC2 AWS SDK.

@@ -1,6 +1,7 @@
 const assert = require('assert');
 const slugid = require('slugid');
 const aws = require('aws-sdk');
+aws.config.logger = console;
 const helper = require('./helper');
 const debug = require('debug')('s3_test');
 const testing = require('taskcluster-lib-testing');
